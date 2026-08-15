@@ -1,9 +1,39 @@
+import type { FabricDynamicGuestDeclarations } from "../protocol.js";
+
+// These names and compatibility fields are the single source of truth for
+// generated core-override overloads. Keep them beside PiToolsApi below so an
+// override extends the same guest contract rather than copying its signatures.
+export const PI_CORE_COMPATIBILITY_ARGUMENT_TYPE_NAMES = {
+  read: "PiReadCompatibilityArgument",
+  bash: "PiBashCompatibilityArgument",
+  edit: "PiEditCompatibilityArgument",
+  write: "PiWriteCompatibilityArgument",
+  grep: "PiGrepCompatibilityArgument",
+  find: "PiFindCompatibilityArgument",
+  ls: "PiLsCompatibilityArgument",
+} as const;
+
+export const PI_CORE_NUMERIC_FIELDS = {
+  read: ["offset", "limit"],
+  bash: ["timeout"],
+  edit: [],
+  write: [],
+  grep: ["context", "limit"],
+  find: ["limit"],
+  ls: ["limit"],
+} as const;
+
 export const GUEST_TYPE_DECLARATIONS = `
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type FabricTransport = "auto" | "process" | "tmux" | "screen" | "localterm" | "herdr";
 type FabricAgentRunner = "pi" | "claude" | "veda";
 type FabricThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+interface FabricActionEffect {
+  kind: "none" | "scoped" | "transactional" | "emission";
+  resources?: string[];
+  ordering?: "commutative" | "ordered" | "unknown";
+}
 interface FabricAction {
   ref: string;
   provider: string;
@@ -13,6 +43,7 @@ interface FabricAction {
   outputSchema?: Record<string, unknown>;
   risk: "read" | "write" | "execute" | "network" | "agent";
   namespace?: string;
+  effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
   task: string;
@@ -28,6 +59,9 @@ interface FabricAgentRequest {
   recursive?: boolean;
   worktree?: boolean;
   schema?: Record<string, unknown>;
+  prompt?: string;
+  instructions?: string;
+  timeout_ms?: number;
 }
 interface FabricHandoffCall {
   readonly ref: string;
@@ -49,6 +83,9 @@ interface FabricHandoffRequest {
   extensions?: boolean;
   recursive?: boolean;
   schema?: Record<string, unknown>;
+  prompt?: string;
+  instructions?: string;
+  timeout_ms?: number;
 }
 interface FabricHandoffResult {
   scheduled: true;
@@ -132,7 +169,9 @@ type FabricLifecycleEventType =
   | "run.completed"
   | "run.failed"
   | "run.stopped"
-  | "run.timed_out";
+  | "run.timed_out"
+  | "tokens.usage"
+  | "component.state";
 type FabricLifecycleDelivery = "steer" | "followUp";
 interface FabricLifecycleSource {
   id: string;
@@ -269,6 +308,7 @@ interface FabricCapabilityActionHead {
   descriptorHash: string;
   risk: "read" | "write" | "execute" | "network" | "agent";
   namespace?: string;
+  effect?: FabricActionEffect;
 }
 interface FabricCapabilityProviderHead {
   key: string;
@@ -407,18 +447,35 @@ type PiBashOptions = { timeout?: number; timeoutMs?: number; settle?: boolean };
 type PiGrepOptions = { path?: string; glob?: string; globPattern?: string; ignoreCase?: boolean; ic?: boolean; caseInsensitive?: boolean; literal?: boolean; context?: number; ctx?: number; limit?: number; max?: number };
 type PiFindOptions = { path?: string; limit?: number; max?: number };
 type PiLsOptions = { limit?: number; max?: number };
+type PiReadArgument = string | (PiPathArgument & PiReadOptions);
+type PiBashArgument = string | (PiCommandArgument & PiBashOptions);
+type PiEditFlatArgument = PiPathArgument & PiOldTextArgument & PiNewTextArgument & { all?: boolean };
+type PiEditArgument = PiPathArgument & ({ edits: PiEditOperation[]; all?: boolean } | PiEditFlatArgument);
+type PiWriteArgument = string | (PiPathArgument & PiContentArgument);
+type PiGrepArgument = string | (PiGrepPatternArgument & PiGrepOptions);
+type PiFindArgument = string | (PiFindPatternArgument & PiFindOptions);
+type PiLsArgument = string | (PiOptionalPathArgument & PiLsOptions);
+type PiNumericString<T> = T extends number ? T | string : T;
+type PiNumericStringOptions<T> = { [K in keyof T]: PiNumericString<T[K]> };
+type PiReadCompatibilityArgument = string | (PiPathArgument & PiNumericStringOptions<PiReadOptions>);
+type PiBashCompatibilityArgument = string | (PiCommandArgument & PiNumericStringOptions<PiBashOptions>);
+type PiEditCompatibilityArgument = PiEditFlatArgument;
+type PiWriteCompatibilityArgument = PiWriteArgument;
+type PiGrepCompatibilityArgument = string | (PiGrepPatternArgument & PiNumericStringOptions<PiGrepOptions>);
+type PiFindCompatibilityArgument = string | (PiFindPatternArgument & PiNumericStringOptions<PiFindOptions>);
+type PiLsCompatibilityArgument = string | (PiOptionalPathArgument & PiNumericStringOptions<PiLsOptions>);
 interface PiToolsApi {
-  read(args: string | (PiPathArgument & PiReadOptions), options?: PiReadOptions): Promise<string>;
-  bash(args: string | (PiCommandArgument & PiBashOptions), options?: PiBashOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
-  edit(args: PiPathArgument & ({ edits: PiEditOperation[]; all?: boolean } | (PiOldTextArgument & PiNewTextArgument & { all?: boolean }))): Promise<{ ok: true; output: string; details: unknown }>;
+  read(args: PiReadArgument, options?: PiReadOptions): Promise<string>;
+  bash(args: PiBashArgument, options?: PiBashOptions): Promise<{ ok: true; output: string; details: unknown } | { ok: false; output: string; details: null; exitCode: number; error: string }>;
+  edit(args: PiEditArgument): Promise<{ ok: true; output: string; details: unknown }>;
   edit(path: string, oldText: string, newText: string): Promise<{ ok: true; output: string; details: unknown }>;
-  write(args: PiPathArgument & PiContentArgument): Promise<{ ok: true; output: string; details: unknown }>;
+  write(args: PiWriteArgument): Promise<{ ok: true; output: string; details: unknown }>;
   write(path: string, content: string): Promise<{ ok: true; output: string; details: unknown }>;
-  grep(args: string | (PiGrepPatternArgument & PiGrepOptions)): Promise<string>;
+  grep(args: PiGrepArgument): Promise<string>;
   grep(pattern: string, path?: string | PiGrepOptions, limit?: number): Promise<string>;
-  find(args: string | (PiFindPatternArgument & PiFindOptions)): Promise<string>;
+  find(args: PiFindArgument): Promise<string>;
   find(pattern: string, path?: string | PiFindOptions, limit?: number): Promise<string>;
-  ls(args?: string | (PiOptionalPathArgument & PiLsOptions), options?: PiLsOptions): Promise<string>;
+  ls(args?: PiLsArgument, options?: PiLsOptions): Promise<string>;
 }
 type FabricActorHostEvent =
   | "resources_discover"
@@ -489,7 +546,9 @@ interface FabricActorRequestBase {
   tools?: string[];
   transport?: FabricTransport;
   timeoutMs?: number;
+  timeout_ms?: number;
   extensions?: boolean;
+  requires?: Array<string | { ref: string; optional?: boolean }>;
   validWhile?: FabricActorValidWhile;
 }
 type FabricActorRequest = FabricActorRequestBase & (
@@ -512,6 +571,9 @@ interface FabricActorInfo {
   thinking?: FabricThinking;
   tools?: string[];
   extensions?: boolean;
+  requirements?: Array<{ ref: string; optional?: boolean }>;
+  capabilityDigest?: string;
+  missingCapabilities?: string[];
   validWhile?: { version: 1; source: string };
   queued: number;
   messages: number;
@@ -537,12 +599,14 @@ interface FabricActorMessage {
   stale?: boolean;
   reason?: string;
 }
+// agentId/agent_id spellings repair to id during agent arg normalization.
+type FabricAgentTargetArgs = { id: string; agentId?: string; agent_id?: string };
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;
   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
-  wait(args: { id: string }): Promise<FabricAgentResult>;
-  status(args: { id: string }): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
+  wait(args: FabricAgentTargetArgs): Promise<FabricAgentResult>;
+  status(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricAgentHandle | FabricMainAgentInfo | FabricActorInfo | FabricParticipantInfo>;
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   self(): Promise<FabricParticipantInfo>;
@@ -557,10 +621,10 @@ interface FabricAgentsApi {
     once?: boolean;
   }): Promise<FabricLifecycleSubscription>;
   subscriptions(args?: { from?: string; to?: string }): Promise<FabricLifecycleSubscription[]>;
-  unsubscribe(args: { id: string }): Promise<{ removed: boolean }>;
+  unsubscribe(args: FabricAgentTargetArgs): Promise<{ removed: boolean }>;
   models(args?: { runner?: FabricAgentRunner; refresh?: boolean }): Promise<FabricModelInfo[]>;
-  stop(args: { id: string }): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
-  cleanup(args: { id: string; deleteBranch?: boolean }): Promise<{ cleaned: boolean }>;
+  stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
+  cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
   setModel(args: { id: string; model?: string }): Promise<FabricActorInfo>;
   setThinking(args: { id: string; thinking?: FabricThinking }): Promise<FabricActorInfo>;
@@ -583,7 +647,7 @@ interface FabricAgentsApi {
   followUp(args: { id: string; message: string; data?: unknown }): Promise<{ queued: true; messageId: string; routed?: "local" | "main" | "mesh"; acknowledged?: boolean }>;
   setSteeringMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
-  actorStatus(args: { id: string }): Promise<FabricActorInfo>;
+  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
   actors(): Promise<FabricActorInfo[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
   remove(args: { id: string }): Promise<{ removed: boolean }>;
@@ -606,7 +670,11 @@ interface FabricMcpTool {
 interface FabricMcpServer {
   [tool: string]: FabricMcpTool;
 }
-type FabricMcpApi = Record<string, FabricMcpServer> & {
+// Management verbs stay members of mcp even when the declare line below is
+// replaced by generated per-server declarations (see the dynamic option on
+// guestTypeDeclarations), so generated surfaces intersect with this type
+// rather than re-declaring them.
+interface FabricMcpManagement {
   servers(): Promise<Array<{ name: string; description: string | null; transport: "http" | "stdio" }>>;
   reload(): Promise<{ servers: string[] }>;
   register(args: {
@@ -621,7 +689,12 @@ type FabricMcpApi = Record<string, FabricMcpServer> & {
     overwrite?: boolean;
   }): Promise<{ registered: string }>;
   call(args: { server: string; tool: string; args?: Record<string, unknown> }): Promise<unknown>;
-};
+}
+// Loose static surface: any server/tool name compiles and argument shapes are
+// enforced at dispatch by the registry. With descriptor data available the
+// execution service replaces the declare-const-mcp line below with a
+// schema-typed rendering of the live cache (runtime/dynamic-guest-types.ts).
+type FabricMcpApi = Record<string, FabricMcpServer> & FabricMcpManagement;
 interface FabricCouncilRunOptions {
   task: string;
   roles: string[];
@@ -663,14 +736,23 @@ interface FabricMeshStateEntry<T = unknown> {
 }
 interface FabricMeshApi {
   self(): Promise<FabricMeshIdentity>;
-  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown }): Promise<FabricMeshEvent>;
-  read(args?: { after?: number; topic?: string; to?: string; limit?: number }): Promise<FabricMeshEvent[]>;
-  members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number }): Promise<FabricParticipantInfo[]>;
+  publish(args: { topic: string; kind?: string; to?: string; text?: string; data?: unknown; message?: string; body?: string }): Promise<FabricMeshEvent>;
+  read(args?: { after?: number; topic?: string; to?: string; limit?: number; max?: number }): Promise<FabricMeshEvent[]>;
+  members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean; limit?: number; max?: number; include_stale?: boolean }): Promise<FabricParticipantInfo[]>;
   get<T = unknown>(args: { key: string }): Promise<FabricMeshStateEntry<T> | null>;
-  list<T = unknown>(args?: { prefix?: string; limit?: number }): Promise<Array<FabricMeshStateEntry<T>>>;
-  put<T = unknown>(args: { key: string; value: T; ifVersion?: number }): Promise<FabricMeshStateEntry<T>>;
-  delete(args: { key: string; ifVersion?: number }): Promise<{ deleted: boolean; version?: number }>;
+  list<T = unknown>(args?: { prefix?: string; limit?: number; max?: number }): Promise<Array<FabricMeshStateEntry<T>>>;
+  put<T = unknown>(args: { key: string; value: T; ifVersion?: number; if_version?: number; version?: number }): Promise<FabricMeshStateEntry<T>>;
+  delete(args: { key: string; ifVersion?: number; if_version?: number; version?: number }): Promise<{ deleted: boolean; version?: number }>;
 }
+// Stable-provider argument bags declare the canonical keys plus the
+// near-miss spellings repaired during argument normalization
+// (providers/arg-normalization.ts and each provider's per-action table). The
+// registry's prepare stage repairs aliases before schema validation, so a
+// call spelled with an alias typechecks instead of tripping the
+// excess-property check; the canonical key wins on conflict, and anything
+// else fails additionalProperties:false validation with the offending
+// property path named. Keep these spillover fields in sync with the provider
+// normalization tables.
 type FabricMemoryBranches = "active" | "all";
 interface FabricMemoryEntryRange {
   first: number;
@@ -694,6 +776,12 @@ interface FabricMemoryRecallArgs {
   since?: number;
   until?: number;
   entryRange?: FabricMemoryEntryRange;
+  q?: string;
+  limit?: number;
+  max?: number;
+  page_size?: number;
+  query_mode?: "literal" | "regex";
+  entry_range?: FabricMemoryEntryRange;
 }
 interface FabricMemoryRecallResult {
   scope?: string;
@@ -734,6 +822,14 @@ interface FabricMemoryExpandArgs {
   entryIds?: string[];
   operationAddresses?: string[];
   entryRange?: FabricMemoryEntryRange;
+  id?: string;
+  file?: string;
+  path?: string;
+  session_id?: string;
+  index?: number;
+  entry_ids?: string[];
+  operation_addresses?: string[];
+  entry_range?: FabricMemoryEntryRange;
 }
 interface FabricMemoryExpandResult {
   session?: string;
@@ -756,7 +852,12 @@ interface FabricMemorySessionInfo {
 interface FabricMemoryApi {
   recall(args?: FabricMemoryRecallArgs): Promise<FabricMemoryRecallResult>;
   expand(args: FabricMemoryExpandArgs): Promise<FabricMemoryExpandResult>;
-  sessions(args?: { scope?: string; branches?: FabricMemoryBranches }): Promise<{
+  sessions(args?: {
+    scope?: string;
+    branches?: FabricMemoryBranches;
+    limit?: number;
+    max?: number;
+  }): Promise<{
     scope?: string;
     branches?: FabricMemoryBranches;
     sessions?: FabricMemorySessionInfo[];
@@ -773,6 +874,8 @@ interface FabricStateTransitionArgs {
   kind?: "state" | "representation";
   complexity?: { files: string[] };
   force?: boolean;
+  name?: string;
+  description?: string;
 }
 interface FabricStateComplexityFile {
   file: string;
@@ -803,14 +906,14 @@ interface FabricStateApi {
     certification: { current: unknown | null; recent: unknown[] };
     recentLabels: string[];
   }>;
-  history(args?: { label?: string; limit?: number; includeArchived?: boolean }): Promise<{
+  history(args?: { label?: string; limit?: number; includeArchived?: boolean; name?: string; max?: number }): Promise<{
     transitions: unknown[];
     labels: string[];
     certifications: unknown[];
   }>;
-  complexity(args?: { files?: string[] }): Promise<{ files: FabricStateComplexityFile[]; netDelta: number }>;
-  verify(args?: { labels?: string[]; includeArchived?: boolean; timeoutMs?: number }): Promise<FabricStateVerificationResult>;
-  goal(args: { check: string; description?: string }): Promise<FabricMeshStateEntry<{ check: string; description?: string }>>;
+  complexity(args?: { files?: string[]; paths?: string[] }): Promise<{ files: FabricStateComplexityFile[]; netDelta: number }>;
+  verify(args?: { labels?: string[]; includeArchived?: boolean; timeoutMs?: number; label?: string }): Promise<FabricStateVerificationResult>;
+  goal(args: { check: string; description?: string; command?: string; cmd?: string; predicate?: string }): Promise<FabricMeshStateEntry<{ check: string; description?: string }>>;
   checkGoal(args?: { timeoutMs?: number }): Promise<{
     passed: boolean;
     output: string;
@@ -879,6 +982,9 @@ interface FabricSchemaApi {
     summary: string;
     evidence: FabricSchemaEvidence[];
     complexityReduction?: boolean;
+    name?: string;
+    description?: string;
+    complexity_reduction?: boolean;
   }): Promise<{
     hypothesisId: string;
     status: string;
@@ -886,14 +992,16 @@ interface FabricSchemaApi {
     fingerprint: string;
     generation: number;
   }>;
-  verify(args: { hypothesisId: string }): Promise<FabricSchemaVerificationResult>;
+  verify(args: { hypothesisId: string; id?: string; hypothesis_id?: string }): Promise<FabricSchemaVerificationResult>;
   commit(args: {
     hypothesisId: string;
     certificate: string;
     operations: FabricSchemaFileOperation[];
     postconditions: FabricSchemaEvidence[];
+    id?: string;
+    hypothesis_id?: string;
   }): Promise<FabricSchemaCommitResult>;
-  abort(args: { hypothesisId: string; certificate?: string }): Promise<{
+  abort(args: { hypothesisId: string; certificate?: string; id?: string; hypothesis_id?: string }): Promise<{
     aborted: true;
     hypothesisId: string;
   }>;
@@ -914,12 +1022,59 @@ interface FabricCompactLastCommit {
   estimatedTokensAfter?: number;
   error?: string;
 }
+type FabricComponentState = "waiting" | "loading" | "active" | "unloading" | "failed" | "quarantined" | "disposed";
+interface FabricComponentEffectInfo {
+  label: string;
+  kind: "none" | "scoped" | "transactional" | "emission";
+  resources: string[];
+  ordering: "commutative" | "ordered" | "unknown";
+}
+interface FabricComponentEffectConflict {
+  withComponent: string;
+  resources: string[];
+  reason: "shared_resource" | "unknown_resource";
+}
+interface FabricComponentInfo {
+  id: string;
+  component: string;
+  parentId?: string;
+  state: FabricComponentState;
+  guarantee: "managed" | "revertible";
+  requirements: string[];
+  provisions: string[];
+  missing: string[];
+  optionalMissing: string[];
+  effects?: FabricComponentEffectInfo[];
+  effectConflicts?: FabricComponentEffectConflict[];
+  targetDigest?: string;
+  error?: string;
+  cleanupErrors?: string[];
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+interface FabricComponentsApi {
+  list(): Promise<{
+    definitions: Array<{ name: string; description?: string; revision: number; requirements: string[]; provisions: string[] }>;
+    components: FabricComponentInfo[];
+  }>;
+  status(args: { id: string }): Promise<FabricComponentInfo>;
+  graph(): Promise<{
+    components: FabricComponentInfo[];
+    edges: Array<{ from: string; to: string; ref: string; kind?: "dependency" | "ownership" }>;
+    cycles: string[][];
+  }>;
+  reload(args?: { id?: string }): Promise<{ components: FabricComponentInfo[] }>;
+}
+
 interface FabricCompactApi {
   request(args?: {
     reason?: string;
     instructions?: string;
     preserve?: string[];
     requestedBy?: string;
+    instruction?: string;
+    requested_by?: string;
   }): Promise<{ requested: true; intent: FabricCompactPendingIntent }>;
   status(): Promise<{ pending?: FabricCompactPendingIntent; last?: FabricCompactLastCommit }>;
   cancel(): Promise<{ cancelled: true }>;
@@ -976,6 +1131,7 @@ declare const mcp: FabricMcpApi;
 declare const memory: FabricMemoryApi;
 declare const state: FabricStateApi;
 declare const schema: FabricSchemaApi;
+declare const components: FabricComponentsApi;
 declare const compact: FabricCompactApi;
 declare const council: FabricCouncilApi;
 declare const workflow: FabricWorkflowApi;
@@ -1009,13 +1165,32 @@ const FULL_CODE_GLOBAL_DECLARATIONS = [
   "declare const extensions: FabricExtensionsApi;\n",
 ];
 
+const PI_LOOSE_DECLARATION = "declare const pi: PiToolsApi;\n";
+const MCP_LOOSE_DECLARATION = "declare const mcp: FabricMcpApi;\n";
+const EXTENSIONS_LOOSE_DECLARATION = "declare const extensions: FabricExtensionsApi;\n";
+
 export interface FabricGuestDeclarationOptions {
   /** Global names to omit (for example providers disabled by configuration). */
   excludeGlobals?: readonly string[];
+  /**
+   * Pre-rendered replacement blocks from buildDynamicGuestDeclarations().
+   * Applied only when the loose anchor line is still present — excluded
+   * globals (or orchestration-only mode, for extensions) keep nothing to
+   * replace, and missing/undefined sections keep the loose surface.
+   */
+  dynamic?: FabricDynamicGuestDeclarations;
+  /**
+   * Additive overloads for the current captured exact-name core overrides.
+   * The block is applied only to the full-code `pi` declaration.
+   */
+  coreOverrides?: string;
 }
 
 const globalDeclarationLine = (name: string): RegExp =>
   new RegExp(`^declare const ${name}: [^\\n]*;\\n`, "m");
+
+const terminatedDeclaration = (block: string): string =>
+  block.endsWith("\n") ? block : `${block}\n`;
 
 export const guestTypeDeclarations = (
   fullCodeMode: boolean,
@@ -1027,8 +1202,27 @@ export const guestTypeDeclarations = (
         (declarations, declaration) => declarations.replace(declaration, ""),
         GUEST_TYPE_DECLARATIONS,
       );
-  return (options.excludeGlobals ?? []).reduce(
+  let result = (options.excludeGlobals ?? []).reduce(
     (declarations, name) => declarations.replace(globalDeclarationLine(name), ""),
     base,
   );
+  if (fullCodeMode && options.coreOverrides && result.includes(PI_LOOSE_DECLARATION)) {
+    result = result.replace(
+      PI_LOOSE_DECLARATION,
+      terminatedDeclaration(options.coreOverrides),
+    );
+  }
+  if (options.dynamic?.mcp && result.includes(MCP_LOOSE_DECLARATION)) {
+    result = result.replace(
+      MCP_LOOSE_DECLARATION,
+      terminatedDeclaration(options.dynamic.mcp),
+    );
+  }
+  if (options.dynamic?.extensions && result.includes(EXTENSIONS_LOOSE_DECLARATION)) {
+    result = result.replace(
+      EXTENSIONS_LOOSE_DECLARATION,
+      terminatedDeclaration(options.dynamic.extensions),
+    );
+  }
+  return result;
 };

@@ -34,6 +34,22 @@ afterEach(() => {
 });
 
 describe("Fabric configuration", () => {
+  it("normalizes declarative component entries", () => {
+    expect(DEFAULT_FABRIC_CONFIG.components).toEqual([]);
+    const config = normalizeFabricConfig({
+      components: [
+        { id: "cache", component: "cache-service", config: { limit: 12 } },
+        { id: "off", component: "observer", disabled: true },
+        { id: "missing-component" },
+        "invalid",
+      ],
+    });
+    expect(config.components).toEqual([
+      { id: "cache", component: "cache-service", config: { limit: 12 } },
+      { id: "off", component: "observer", disabled: true },
+    ]);
+  });
+
   it("keeps model-visible execution output at Pi read parity by default", () => {
     expect(DEFAULT_FABRIC_CONFIG.executor.maxOutputChars).toBe(50_000);
   });
@@ -323,6 +339,33 @@ describe("Fabric configuration", () => {
         ui: { showAgentToolPreview: "off", updateDebounceMs: "fast" },
       }).ui,
     ).toMatchObject({ showAgentToolPreview: true, updateDebounceMs: 100 });
+  });
+
+  it("defaults, validates, merges, and persists tool display independently of full code mode", () => {
+    expect(DEFAULT_FABRIC_CONFIG.ui.toolDisplay).toBe("compact");
+    expect(normalizeFabricConfig({ ui: { toolDisplay: "full" } }).ui.toolDisplay).toBe("full");
+    expect(normalizeFabricConfig({ ui: { toolDisplay: "minimal" } }).ui.toolDisplay).toBe("compact");
+    expect(normalizeFabricConfig({ fullCodeMode: false, ui: { toolDisplay: "compact" } }))
+      .toMatchObject({ fullCodeMode: false, ui: { toolDisplay: "compact" } });
+
+    const root = temporaryDirectory();
+    const cwd = path.join(root, "project");
+    const agentDir = path.join(root, "agent");
+    fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    fs.mkdirSync(agentDir, { recursive: true });
+    const location = { cwd, agentDir, projectTrusted: true };
+
+    saveFabricConfig({ ...location, scope: "global" }, { ui: { toolDisplay: "compact" } });
+    saveFabricConfig({ ...location, scope: "project" }, { ui: { toolDisplay: "full" } });
+
+    expect(loadFabricConfigForScope(location, "global").ui.toolDisplay).toBe("compact");
+    expect(loadFabricConfig(location).ui.toolDisplay).toBe("full");
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, "fabric.json"), "utf8"))).toMatchObject({
+      ui: { toolDisplay: "compact" },
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(cwd, ".pi", "fabric.json"), "utf8"))).toMatchObject({
+      ui: { toolDisplay: "full" },
+    });
   });
 
   it("accepts legacy ui keys as fallback for renamed settings", () => {

@@ -35,6 +35,7 @@ import {
   expandSkillDirMarkersForRead,
   expandSkillDirMarkersInSkillBlock,
 } from "./core/skill-dir.js";
+import { coreOverridePromptGuidance } from "./core/core-override-guidance.js";
 import { restoreSkillsForFullCodePrompt } from "./core/skill-prompt.js";
 import {
   FabricDirectToolApproval,
@@ -49,19 +50,20 @@ import {
   capturedToolNamespace,
   listCapturedToolDescriptors,
 } from "./providers/captured-tools-provider.js";
-import {
-  sanitizeMcpRefPart,
-  toMcpAdvisoryDescriptor,
-} from "./providers/mcp-provider.js";
+import { toMcpAdvisoryDescriptor } from "./providers/mcp-advisory.js";
+import { sanitizeMcpRefPart } from "./ref-names.js";
 import { createFabricExecTool } from "./fabric-exec-tool.js";
 import { FabricState } from "./fabric-state.js";
 import { piHostCompatibilityWarning } from "./host-compatibility.js";
 import {
+  FABRIC_COMPONENT_REGISTER_EVENT,
   FABRIC_PROVIDER_REGISTER_EVENT,
+  type FabricComponentRegistration,
   type FabricProviderRegistration,
 } from "./protocol.js";
 import type { AgentToolResultMessage } from "./agents/types.js";
 import { FabricUiController } from "./ui/controller.js";
+import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
@@ -76,11 +78,32 @@ import { fileURLToPath } from "node:url";
 // same fabric-exec / fabric-advisor / fabric-council skill references as the
 // main agent, which gets them through the package manifest.
 const FABRIC_EXTENSION_ENTRY_PATH = path.resolve(fileURLToPath(import.meta.url));
-const FABRIC_SKILLS_DIR = path.resolve(
-  path.dirname(FABRIC_EXTENSION_ENTRY_PATH),
-  "..",
-  "skills",
-);
+const FABRIC_ENTRY_DIR = path.dirname(FABRIC_EXTENSION_ENTRY_PATH);
+const FABRIC_RUNTIME_PATHS = {
+  extension: FABRIC_EXTENSION_ENTRY_PATH,
+  worker: path.join(FABRIC_ENTRY_DIR, "worker.js"),
+  residentHost: path.join(FABRIC_ENTRY_DIR, "residency", "host.js"),
+  skills: path.resolve(FABRIC_ENTRY_DIR, "..", "skills"),
+};
+const FABRIC_SKILLS_DIR = FABRIC_RUNTIME_PATHS.skills;
+
+const componentRegistrationFrom = (
+  value: unknown,
+): FabricComponentRegistration | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const registration = value as Partial<FabricComponentRegistration>;
+  const component = registration.component;
+  if (
+    registration.version !== 1 ||
+    typeof component !== "object" ||
+    component === null ||
+    typeof component.name !== "string" ||
+    typeof component.activate !== "function"
+  ) {
+    return undefined;
+  }
+  return registration as FabricComponentRegistration;
+};
 
 const registrationFrom = (value: unknown): FabricProviderRegistration | undefined => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -137,6 +160,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
         }
       },
     },
+    { paths: FABRIC_RUNTIME_PATHS },
   );
   const directToolApproval = new FabricDirectToolApproval(
     pi,
@@ -146,6 +170,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   const pendingHandoffs = new Map<string, PendingFabricHandoff>();
   const toolOwnership = new FabricToolOwnership(pi);
   const fabricUi = new FabricUiController(state, codePreviewSettings);
+  const toolDisplay = new FabricToolDisplayController();
 
   const capturePolicy = () => effectiveToolCaptureConfig(state.config);
   // Advisor slices refresh independently: captured tools only while they are
@@ -153,7 +178,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   // visible); the MCP descriptor-cache slice whenever mcp.advisory is on —
   // MCP tools never have native visibility, so the gate is capture-agnostic.
   const refreshAdvisorSources = (): void => {
-    if (!state.initialized) return;
+    if (!state.cwd) return;
     const policy = capturePolicy();
     capabilityAdvisor.setSource(
       "captured",
@@ -185,7 +210,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   // for state to be ready rather than reading an uninitialized config.
   const { reassert: reassertToolOwnership, schedule: scheduleOwnershipReassert } =
     createToolOwnershipReassertion({
-      ready: () => state.initialized,
+      ready: () => state.cwd !== undefined,
       active: () => {
         const policy = capturePolicy();
         return policy.enabled && policy.hideFromModel && fabricOwnsModelTools();
@@ -193,6 +218,18 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
       hiddenNames: hiddenCapturedToolNames,
       apply: (hidden) => toolOwnership.apply(true, hidden),
     });
+
+  const unsubscribeComponentRegistration = pi.events.on(
+    FABRIC_COMPONENT_REGISTER_EVENT,
+    (value: unknown) => {
+      const registration = componentRegistrationFrom(value);
+      if (!registration) throw new Error("Invalid Pi Fabric component registration");
+      state.registerExternalComponent(
+        registration.component,
+        registration.overwrite === undefined ? {} : { overwrite: registration.overwrite },
+      );
+    },
+  );
 
   const unsubscribeProviderRegistration = pi.events.on(
     FABRIC_PROVIDER_REGISTER_EVENT,
@@ -216,6 +253,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     codePreviewSettings,
     pendingHandoffs,
     decorateShell,
+    toolDisplay,
   );
   const refreshCodePreviewSettings = (): void => {
     Object.assign(codePreviewSettings, state.config.codePreview);
@@ -362,9 +400,27 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     context.ui.notify(skipReason, "warning");
   };
 
+  const cleanupActivationSideEffects = (): void => {
+    uninstallHaltOnEscape();
+    fabricUi.stop();
+  };
+  state.setActivationHook(async (context) => {
+    refreshCodePreviewSettings();
+    Object.assign(
+      fabricTool,
+      createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell, toolDisplay),
+    );
+    await autoArmPrewalk(context);
+    applyFabricMode();
+    fabricUi.start(context);
+    installHaltOnEscape(context);
+  }, cleanupActivationSideEffects);
+
   pi.on("session_start", async (_event, context) => {
     pendingHandoffs.clear();
     directToolApproval.clear();
+    toolDisplay.clear();
+    uninstallHaltOnEscape();
     fabricUi.stop();
     suspendToolCapture();
     capabilityAdvisor.reset();
@@ -377,22 +433,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
         if (context.hasUI) context.ui.notify(warning, "warning");
       }
     }
-    await state.initialize(context);
-    try {
-      refreshCodePreviewSettings();
-      Object.assign(
-        fabricTool,
-        createFabricExecTool(state, codePreviewSettings, pendingHandoffs, decorateShell),
-      );
-    } catch (error) {
-      console.warn("[pi-fabric] Failed to refresh code preview settings.", error);
-    }
+    await state.bootstrap(context);
+    refreshCodePreviewSettings();
     applyFabricMode();
-    fabricUi.start(context);
-    // After initialize() (which cancels any prior arm) so alwaysRearm opens
-    // the fresh session armed.
-    await autoArmPrewalk(context);
-    installHaltOnEscape(context);
+    if (state.shouldEagerlyActivate(context)) await state.ensure(context);
   });
 
   // Branch changes move the leaf: ash, emitted echoes, and spent advisory
@@ -400,6 +444,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   pi.on("session_tree", async (_event, context) => {
     capabilityAdvisor.reset();
     refreshAdvisorLedger(context);
+    // Pi emits session_tree before it clears and rebuilds the transcript:
+    // drop card invalidators from abandoned branches so a later display-mode
+    // switch only refreshes cards registered by the rebuilt active branch.
+    toolDisplay.clear();
     return undefined;
   });
 
@@ -421,14 +469,16 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("turn_end", async (event, context) => {
-    if (!state.initialized) return;
     // Furnace feedback: did the just-fired advisory lead to captured tool use?
     capabilityAdvisor.endTurn();
-    await state.publishHostLifecycle("pi.turn_end", event);
+    if (state.initialized) await state.publishHostLifecycle("pi.turn_end", event);
   });
 
   pi.on("agent_settled", async (event, context) => {
-    if (!state.initialized) return;
+    if (!state.initialized) {
+      await compactAtConfiguredThreshold(context, state.config);
+      return;
+    }
     const sessionId = context.sessionManager.getSessionId();
     const settledInPlace = await settleInPlacePrewalk(state.prewalk, pi, context, {
       compactOnReturn: state.config.prewalk.compactOnReturn,
@@ -567,19 +617,19 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   // pi-core's own summarization proceeds normally.
   registerCompactionHook(pi, {
     getEngine: () =>
-      state.initialized
+      state.cwd
         ? state.config.compaction.engine
         : DEFAULT_FABRIC_CONFIG.compaction.engine,
     getTargetContextRatio: () =>
-      state.initialized
+      state.cwd
         ? state.config.compaction.targetContextRatio
         : DEFAULT_FABRIC_CONFIG.compaction.targetContextRatio,
     getThresholdContextRatio: (modelKey) =>
-      state.initialized
+      state.cwd
         ? state.config.compaction.thresholds[modelKey]
         : DEFAULT_FABRIC_CONFIG.compaction.thresholds[modelKey],
     getThresholdTokens: (modelKey) =>
-      state.initialized
+      state.cwd
         ? state.config.compaction.tokenThresholds[modelKey]
         : DEFAULT_FABRIC_CONFIG.compaction.tokenThresholds[modelKey],
   });
@@ -615,10 +665,10 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("before_agent_start", async (event) => {
-    const fullCodeMode = state.initialized
+    const fullCodeMode = state.cwd
       ? state.config.fullCodeMode
       : DEFAULT_FABRIC_CONFIG.fullCodeMode;
-    const schemaMode = state.initialized
+    const schemaMode = state.cwd
       ? state.config.schema.mode
       : DEFAULT_FABRIC_CONFIG.schema.mode;
     const effectiveFullCodeMode = fullCodeMode || schemaMode === "enforce";
@@ -638,19 +688,22 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
       : undefined;
     const guidance = (effectiveFullCodeMode
       ? "Pi Fabric full code mode: `fabric_exec` is the only way to call Pi core tools — use them as `pi.*` inside `code`.\nExamples and returns: `pi.read('/x')`, `pi.grep('TODO','src')` / `pi.grep({pattern:'TODO', path:'src', ignoreCase:true, context:2})`, `pi.find({pattern:'*.ts', path:'src', limit:20})`, and `pi.ls('src')` return strings; `pi.bash({cmd:'ls'})`, `pi.edit({path:'/x', old:'a', new:'b'})`, and `pi.write({path:'/y', text:'z'})` return `{ok, output, details}` (read `.output`); failed core calls reject, including `bash` on an ordinary nonzero exit; pass `settle: true` to `pi.bash` to get `{ ok: false, exitCode, output, error }` instead. Timeout, cancellation, approval, and security failures still reject.\n`tools` is discovery + generic calls only (`providers`/`catalog`/`list`/`search`/`describe`/`call`/`models`). Call known MCP tools as `mcp.<sanitized_server>.<sanitized_tool>(args)`, captured tools as `extensions.<tool>(args)`, and stable providers as `memory.*`, `state.*`, `schema.*`, or `compact.*`. Use `tools.call({ref,args})` for computed refs. `pi` is the core tools; `π.<key>` reads named `strings` (not a tool)."
-      : "Pi Fabric is in orchestration-only mode. Pi core and registered extension tools stay on their native direct execution path; inside fabric_exec, `pi.*` and `extensions.*` are unavailable. Call known actions through `mcp.<sanitized_server>.<sanitized_tool>(args)`, `memory.*`, `state.*`, `schema.*`, `compact.*`, `agents.*`, or `mesh.*`; use `tools.catalog`/`search`/`describe`/`list` for discovery and `tools.call({ref,args})` for computed refs. Other surfaces are opt-in via user-loaded skills.")
+      : "Pi Fabric is in orchestration-only mode. Pi core and registered extension tools stay on their native direct execution path; inside fabric_exec, `pi.*` and `extensions.*` are unavailable. Call known actions through `mcp.<sanitized_server>.<sanitized_tool>(args)`, `memory.*`, `state.*`, `schema.*`, `components.*`, `compact.*`, `agents.*`, or `mesh.*`; use `tools.catalog`/`search`/`describe`/`list` for discovery and `tools.call({ref,args})` for computed refs. Other surfaces are opt-in via user-loaded skills.")
       + (schemaMode === "enforce"
         ? "\n\nSchema enforce mode is fixed for this session. Reads remain available, but protected-workspace changes must use schema.hypothesize → schema.verify → schema.commit in the same fabric_exec invocation. Direct pi.edit/write/bash, agents, state/mesh writes, compaction requests, MCP, extensions, and external providers are blocked by the host gate."
         : schemaMode === "audit"
           ? "\n\nSchema audit mode reports actions that enforce mode would block, but preserves their current behavior."
           : "")
       + (skillReferenceGuidance ? `\n\n${skillReferenceGuidance}` : "");
+    const overrideGuidance = effectiveFullCodeMode
+      ? coreOverridePromptGuidance(capturedTools)
+      : "";
     // One-shot capability steering: when the prompt's vocabulary matches a
     // capability source's fingerprint, name the tools once so the model
     // reaches for extensions.* / mcp.* instead of re-implementing them. Slice
     // membership already encodes visibility (captured tools only while
     // hidden; MCP while mcp.advisory is on), so any non-empty index fires.
-    const captureSnapshot = state.initialized ? capturePolicy() : undefined;
+    const captureSnapshot = state.cwd ? capturePolicy() : undefined;
     const advisory =
       captureSnapshot && capabilityAdvisor.hasSources()
         ? capabilityAdvisor.evaluate(event.prompt, captureSnapshot.advisory)
@@ -659,7 +712,7 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     // message below is the transcript record a session replay recovers after
     // a reload.
     return {
-      systemPrompt: `${systemPrompt}\n\n${guidance}`,
+      systemPrompt: `${systemPrompt}\n\n${guidance}${overrideGuidance}`,
       ...(advisory
         ? {
             message: {
@@ -679,17 +732,19 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async () => {
+    unsubscribeComponentRegistration();
     unsubscribeProviderRegistration();
+    pendingHandoffs.clear();
+    directToolApproval.clear();
+    toolDisplay.clear();
     try {
-      pendingHandoffs.clear();
-      directToolApproval.clear();
+      await state.shutdown();
+    } finally {
       uninstallHaltOnEscape();
       fabricUi.stop();
       suspendToolCapture();
       toolOwnership.release();
       fabricToolLifecycle.clear();
-      await state.shutdown();
-    } finally {
       toolCapture.dispose();
     }
   });
@@ -708,8 +763,8 @@ export default async function piFabric(pi: ExtensionAPI): Promise<void> {
     capturedTools,
     applyFabricMode,
     suspendToolCapture,
-    autoArmPrewalk,
     refreshCodePreviewSettings,
+    refreshToolDisplay: () => toolDisplay.refresh(),
   });
 }
 

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { CapturedToolCatalog } from "../capture/catalog.js";
 import type { FabricActorHostEvent } from "../actors/types.js";
@@ -6,7 +6,6 @@ import type { FabricState } from "../fabric-state.js";
 import { armFabricPrewalkSession } from "../prewalk/arm.js";
 import { truncateMiddle } from "../util.js";
 import type { FabricUiController } from "../ui/controller.js";
-import { openFabricSettings } from "../ui/settings.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -16,8 +15,9 @@ interface FabricCommandDeps {
   capturedTools: CapturedToolCatalog;
   applyFabricMode: () => void;
   suspendToolCapture: () => void;
-  autoArmPrewalk: (context: ExtensionContext) => Promise<void>;
+  autoArmPrewalk?: (context: ExtensionContext) => Promise<void>;
   refreshCodePreviewSettings?: () => void;
+  refreshToolDisplay?: () => void;
 }
 
 const extractContentText = (content: unknown): string => {
@@ -102,7 +102,7 @@ const resolvePrewalkModel = async (
 };
 
 export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps): void {
-  const { state, fabricUi, capturedTools, applyFabricMode, suspendToolCapture, autoArmPrewalk } = deps;
+  const { state, fabricUi, capturedTools, applyFabricMode, suspendToolCapture } = deps;
   pi.registerCommand("fabric", {
     description: "Open Fabric, arm prewalk, reload, or manage agents and actors",
     getArgumentCompletions: (argumentPrefix: string): AutocompleteItem[] | null => {
@@ -218,22 +218,29 @@ export function registerFabricCommand(pi: ExtensionAPI, deps: FabricCommandDeps)
       if (command === "reload") {
         fabricUi.stop();
         suspendToolCapture();
-        await state.initialize(context);
-        applyFabricMode();
-        fabricUi.start(context);
-        // initialize() cancels the arm; alwaysRearm sessions re-open armed.
-        await autoArmPrewalk(context);
+        try {
+          await state.initialize(context);
+        } catch (error) {
+          fabricUi.stop();
+          suspendToolCapture();
+          throw error;
+        }
         context.ui.notify("Pi Fabric reloaded", "info");
+        // initialize() reloads configuration, so an externally edited
+        // ui.toolDisplay must re-render existing transcript cards too.
+        deps.refreshToolDisplay?.();
         return;
       }
       if (command === "settings") {
+        const { openFabricSettings } = await import("../ui/settings.js");
         await openFabricSettings(context, {
           state,
           applyFabricMode,
           capturedTools,
-          ...(deps.refreshCodePreviewSettings
-            ? { onConfigApplied: deps.refreshCodePreviewSettings }
-            : {}),
+          onConfigApplied: () => {
+            deps.refreshCodePreviewSettings?.();
+            deps.refreshToolDisplay?.();
+          },
         });
         return;
       }

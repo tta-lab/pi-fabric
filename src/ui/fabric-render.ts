@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AppKeybinding, Theme } from "@earendil-works/pi-coding-agent";
 import type { CodePreviewSettings } from "./code-preview.js";
+import { formatToolCallDuration } from "./tool-call-timing.js";
 import {
   getKeybindings,
   truncateToWidth,
@@ -32,6 +33,8 @@ export interface FabricRenderAudit {
   result?: unknown;
   resultTruncated?: boolean;
   preview?: unknown;
+  /** True for audits reconstructed from the durable trace: args are privacy-projected and results/previews were never persisted. */
+  fromTrace?: boolean;
   startedAt?: number;
   endedAt?: number;
   previewHeadline?: string;
@@ -603,6 +606,17 @@ const callHeadlinePreview = (audit: FabricRenderAudit): string | undefined => {
     || structuralCallDetail(provider, tool, args, audit.result);
 };
 
+const nestedResultTruncated = (audit: FabricRenderAudit): boolean => {
+  if (audit.resultTruncated === true) return true;
+  const result = audit.result;
+  if (typeof result !== "object" || result === null) return false;
+  const details = (result as Record<string, unknown>).details;
+  if (typeof details !== "object" || details === null) return false;
+  const truncation = (details as Record<string, unknown>).truncation;
+  if (typeof truncation !== "object" || truncation === null) return false;
+  return (truncation as Record<string, unknown>).truncated === true;
+};
+
 /** Compact one-line title for a nested Fabric call, e.g. `read src/index.ts` or `$ ls -la`. */
 export function nestedCallTitle(
   audit: FabricRenderAudit,
@@ -610,10 +624,27 @@ export function nestedCallTitle(
   invalidate?: () => void,
   core?: { cwd: string; settings: CodePreviewSettings },
 ): string {
+  const title = nestedCallTitleText(audit, theme, invalidate, core);
+  return nestedResultTruncated(audit)
+    ? `${title} ${theme.fg("warning", "· truncated")}`
+    : title;
+}
+
+const nestedCallTitleText = (
+  audit: FabricRenderAudit,
+  theme: Theme,
+  invalidate?: () => void,
+  core?: { cwd: string; settings: CodePreviewSettings },
+): string => {
   const coreTitle = core
     ? coreToolTitle(audit, theme, { ...core, ...(invalidate ? { invalidate } : {}) })
     : null;
   if (coreTitle) return coreTitle;
+  const timing = core?.settings.toolCallTiming
+    ? formatToolCallDuration(audit.startedAt, audit.endedAt)
+    : undefined;
+  const withTiming = (value: string): string =>
+    timing ? `${value}${theme.fg("dim", ` · ${timing}`)}` : value;
   const ref = audit.ref;
   const provider = audit.provider ?? ref.split(".")[0] ?? ref;
   const tool = audit.tool ?? ref.split(".")[1] ?? ref;
@@ -627,7 +658,7 @@ export function nestedCallTitle(
     audit.preview,
     audit.previewHeadline,
   );
-  if (providerDetail) return `${title} ${theme.fg("accent", providerDetail)}`;
+  if (providerDetail) return withTiming(`${title} ${theme.fg("accent", providerDetail)}`);
   const command = argString(args, "command");
   if (command) {
     const firstLine = command.split("\n")[0] ?? "";
@@ -635,7 +666,7 @@ export function nestedCallTitle(
       firstLine.length > 0 ? highlightCode(firstLine, "bash", invalidate) : null;
     const cmd =
       highlighted && highlighted[0] ? highlighted[0] : theme.fg("accent", firstLine);
-    return `${title} ${theme.fg("dim", "$")} ${cmd}`;
+    return withTiming(`${title} ${theme.fg("dim", "$")} ${cmd}`);
   }
   const path = argString(args, "path");
   const pattern = argString(args, "pattern");
@@ -650,8 +681,8 @@ export function nestedCallTitle(
       || audit.previewHeadline
       || "";
   }
-  return detail ? `${title} ${theme.fg("accent", detail)}` : title;
-}
+  return withTiming(detail ? `${title} ${theme.fg("accent", detail)}` : title);
+};
 
 const transcriptToolAudit = (entry: FabricTranscriptEntry): FabricRenderAudit => {
   const rawName = entry.toolName ?? entry.label;
@@ -895,6 +926,7 @@ export interface FabricMulticallPartialInput {
   core?: { cwd: string; settings: CodePreviewSettings } | undefined;
   showAgentToolPreview?: boolean | undefined;
   spinner?: string | undefined;
+  activityLabel?: string | undefined;
 }
 
 export const singleCallProgressLine = (
@@ -920,7 +952,7 @@ export const renderFabricMulticallPartial = (
   const done = input.audits.filter((audit) => audit.success !== undefined).length;
   let header = theme.fg(
     "warning",
-    `◆ Fabric running · ${done}/${input.audits.length} calls`,
+    `◆ ${input.activityLabel ?? "Fabric"} running · ${done}/${input.audits.length} calls`,
   );
   const progress = input.progress ? compactProgressPreview(input.progress) : "";
   if (progress) header += theme.fg("dim", ` · ${progress}`);

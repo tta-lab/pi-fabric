@@ -1,7 +1,8 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
 import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
 import { runAbortable, settleWithin } from "../async-settlement.js";
-import { transpileFabricCode } from "./type-checker.js";
+import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
+import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
 
 export type FabricSandboxTerminationReason =
   | "completed"
@@ -28,6 +29,7 @@ export interface FabricSandboxOptions {
     args: Record<string, unknown>,
   ): number | undefined;
   transpiledCode?: string;
+  transpiledSourceMap?: string;
 }
 
 export type FabricHostCall = (
@@ -408,6 +410,8 @@ globalThis["π"] = new Proxy(__piStrings, {
 });
 // Stable providers share a lazy dispatch proxy; the guest declarations keep
 // their known actions typed while the registry remains the runtime authority.
+// extensions' per-tool surface is additionally rendered from the captured
+// catalog by guestTypeDeclarations (runtime/dynamic-guest-types.ts).
 const __providerProxy = (provider) => new Proxy({}, {
   get(_target, property) {
     if (property === "then" || typeof property === "symbol") return undefined;
@@ -418,6 +422,7 @@ globalThis.extensions = __providerProxy("extensions");
 globalThis.memory = __providerProxy("memory");
 globalThis.state = __providerProxy("state");
 globalThis.schema = __providerProxy("schema");
+globalThis.components = __providerProxy("components");
 globalThis.compact = __providerProxy("compact");
 const __createActor = async (args = {}) => {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
@@ -502,6 +507,10 @@ globalThis.mesh = Object.freeze({
   put: (args) => __call("mesh.put", args),
   delete: (args) => __call("mesh.delete", args),
 });
+// The mcp proxy itself stays schema-less — the registry validates args at
+// dispatch — but guestTypeDeclarations renders per-server argument types from
+// the live descriptor cache (runtime/dynamic-guest-types.ts), so known tools
+// fail type-check on argument-shape mistakes before this proxy ever runs.
 globalThis.mcp = new Proxy({}, {
   get(_target, server) {
     if (server === "then") return undefined;
@@ -985,8 +994,12 @@ export class QuickJsRuntime {
 
       executionGate = context.newPromise();
       context.setProp(context.global, "__fabricExecutionGate", executionGate.handle);
-      const guestProgram = options.transpiledCode ?? transpileFabricCode(code);
-      const wrappedCode = `${guestProgram}\nPromise.race([__piFabricMain(), globalThis.__fabricExecutionGate])`;
+      const guestBundle = options.transpiledCode === undefined
+        ? transpileFabricCodeWithSourceMap(code)
+        : { code: options.transpiledCode, sourceMap: options.transpiledSourceMap };
+      const guestStackMap = createGuestStackMap(guestBundle.sourceMap);
+      const guestLineCount = guestBundle.code.split("\n").length;
+      const wrappedCode = `${guestBundle.code}\nPromise.race([__piFabricMain(), globalThis.__fabricExecutionGate])`;
       const evaluation = context.evalCode(wrappedCode, "pi-fabric-guest.js");
       runtime.executePendingJobs();
       if (evaluation.error) {
@@ -996,7 +1009,7 @@ export class QuickJsRuntime {
           ? "Execution cancelled"
           : deadlineExceeded
             ? timeoutMessage()
-            : formatValue(context.dump(evaluation.error));
+            : remapGuestErrorText(formatValue(context.dump(evaluation.error)), guestStackMap, guestLineCount);
         evaluation.error.dispose();
         abortHostCalls(error);
         return {
@@ -1040,7 +1053,7 @@ export class QuickJsRuntime {
           ? "Execution cancelled"
           : deadlineExceeded
             ? timeoutMessage()
-            : formatValue(context.dump(resolution.error));
+            : remapGuestErrorText(formatValue(context.dump(resolution.error)), guestStackMap, guestLineCount);
         resolution.error.dispose();
         abortHostCalls(error);
         return {

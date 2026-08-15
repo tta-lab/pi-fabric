@@ -57,6 +57,7 @@ const APPROVAL_MODES = ["allow", "ask", "auto", "deny"] as const;
 const RUNNERS = ["pi", "claude", "veda"] as const;
 const TRANSPORTS = ["auto", "process", "tmux", "screen", "localterm", "herdr"] as const;
 const WIDGET_MODES = ["auto", "always", "hidden"] as const;
+const TOOL_DISPLAY_MODES = ["full", "compact"] as const;
 const ADVISORY_MODES = ["hidden", "enabled", "disabled"] as const satisfies readonly FabricCapabilityAdvisoryMode[];
 const ADVISORY_THRESHOLDS = ["0.6", "0.9", "1.4", "2.0"] as const;
 const ADVISORY_SESSION_CAPS = ["1", "3", "5", "10"] as const;
@@ -489,7 +490,8 @@ const sectionSubmenu = (
   items: SettingItem[],
   persist: (id: string, value: string) => void,
 ): SettingsSubmenu => (_currentValue, done) =>
-  new SectionSubmenu(theme, title, description, markDrillIn(items), persist, () => done());
+  // Match the root page: sections get type-to-search filtering too.
+  new SectionSubmenu(theme, title, description, markDrillIn(items), persist, () => done(), true);
 
 class IntegerInputSubmenu extends Container {
   readonly input: Input;
@@ -1340,6 +1342,20 @@ export const buildFabricSettingsItems = (
               "Maximum USD spend for agent work across the whole recursion tree. 0 disables the budget.",
             ),
           }),
+          setting("agents.sessionExport", "Usage export", config.agents.sessionExport ? "true" : "false", {
+            description:
+              "Write usage-only pi-format session files (tokens/cost, never transcript content) for every agent run so tokscale and ccusage can track Fabric subagents.",
+            values: BOOLEANS,
+          }),
+          setting("agents.sessionExportDir", "Usage export dir", config.agents.sessionExportDir || "~/.pi/agent (co-hosted, hidden .fabric namespace)", {
+            description:
+              "Root of the export store; sessions land under <dir>/sessions/.fabric/. Default reuses pi's own agent dir (tokscale/ccusage count it with zero setup; pi's resume picker never sees the hidden namespace). PI_FABRIC_AGENT_DIR overrides.",
+            submenu: stringInputSubmenu(
+              theme,
+              "Usage export dir",
+              "Root of the export store; PI_FABRIC_AGENT_DIR overrides this value.",
+            ),
+          }),
           setting("agents.maxTokensPerChild", "Token limit", formatTokens(config.agents.maxTokensPerChild), {
             description:
               "Maximum cumulative tokens a single agent may use before it is terminated (0 disables). Caps a runaway child before the host session compacts.",
@@ -1449,6 +1465,11 @@ export const buildFabricSettingsItems = (
           setting("ui.widget", "Widget", config.ui.widget, {
             description: "When to show the activity widget above the editor.",
             values: WIDGET_MODES,
+          }),
+          setting("ui.toolDisplay", "Tool display", config.ui.toolDisplay, {
+            description:
+              "Show full Fabric TypeScript or a compact intent-and-tools transcript; the tool-expand key (ctrl+o) expands a compact card to full.",
+            values: TOOL_DISPLAY_MODES,
           }),
           setting(
             "ui.showAgentToolPreview",

@@ -2,6 +2,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
 export const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";
+export const FABRIC_COMPONENT_REGISTER_EVENT = "pi-fabric:component:register:v1";
+export const FABRIC_COMPONENT_DISCOVER_EVENT = "pi-fabric:component:discover:v1";
 
 /** Identifies host-side tool lifecycle events replayed for a nested Fabric call. */
 export const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = "fabric_";
@@ -36,6 +38,14 @@ export const readFabricToolResultProxyDetailsV1 = (
 };
 
 export type FabricRisk = "read" | "write" | "execute" | "network" | "agent";
+export type FabricEffectKind = "none" | "scoped" | "transactional" | "emission";
+export type FabricEffectOrdering = "commutative" | "ordered" | "unknown";
+
+export interface FabricActionEffect {
+  kind: FabricEffectKind;
+  resources?: string[];
+  ordering?: FabricEffectOrdering;
+}
 export type FabricActivityEntityKind =
   | "agent"
   | "actor"
@@ -64,6 +74,7 @@ export interface FabricActionDescriptor {
   outputSchema?: Record<string, unknown>;
   risk: FabricRisk;
   namespace?: string;
+  effect?: FabricActionEffect;
 }
 
 export interface FabricCapabilityActionHead {
@@ -75,6 +86,7 @@ export interface FabricCapabilityActionHead {
   descriptorHash: string;
   risk: FabricRisk;
   namespace?: string;
+  effect?: FabricActionEffect;
 }
 
 export interface FabricCapabilityProviderHead {
@@ -84,6 +96,30 @@ export interface FabricCapabilityProviderHead {
   description: string;
   descriptorHash: string;
   actions: FabricCapabilityActionHead[];
+}
+
+export interface FabricCapabilityBindingView {
+  ref: string;
+  provider: string;
+  providerBindingId: string;
+  generation: number;
+  descriptorHash: string;
+}
+
+export interface FabricCommittedCapabilityView {
+  id: string;
+  /** Runtime-local digest including provider binding generations. */
+  digest: string;
+  /** Portable digest of exact refs and descriptor semantics across runtimes. */
+  semanticDigest: string;
+  bindings: Record<string, FabricCapabilityBindingView>;
+}
+
+export interface FabricCapabilityResolution {
+  satisfied: boolean;
+  missing: string[];
+  optionalMissing: string[];
+  view?: FabricCommittedCapabilityView;
 }
 
 export interface FabricCapabilityCatalog {
@@ -106,6 +142,37 @@ export interface FabricProviderListRequest {
   namespace?: string;
   query?: string;
   limit?: number;
+}
+
+/** One named action whose arguments should be typed in guest declarations. */
+export interface FabricNamedActionTypeSource {
+  name: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/** One MCP server plus the tools to type for `mcp.<server>.*` guest calls. */
+export interface FabricMcpServerTypeSource {
+  server: string;
+  tools: FabricNamedActionTypeSource[];
+}
+
+/**
+ * Live descriptor snapshot the registry hands to the guest declaration
+ * builder so dynamic surfaces (mcp, extensions) get argument checking before
+ * the sandbox runs. Empty/absent sections keep the loose static declarations.
+ */
+export interface FabricGuestTypeSources {
+  mcpServers?: FabricMcpServerTypeSource[];
+  extensionTools?: FabricNamedActionTypeSource[];
+}
+
+/**
+ * Pre-rendered `declare const` blocks replacing the loose mcp/extensions
+ * declaration lines. Values are full replacement text (helpers + declare).
+ */
+export interface FabricDynamicGuestDeclarations {
+  mcp?: string;
+  extensions?: string;
 }
 
 export interface FabricInvocationContext {
@@ -133,6 +200,14 @@ export interface FabricInvocationContext {
   // Ephemeral renderer-only metadata. It is exposed to live Fabric previews but
   // never projected into the durable execution trace.
   attachPreview?(preview: unknown): void;
+  capabilityView?: FabricCommittedCapabilityView;
+  /** Advisory for ordinary calls; strict components reject concurrent conflicting effects. */
+  effectPolicy?: "advisory" | "strict";
+}
+
+export interface FabricScopedProviderResult {
+  value: unknown;
+  dispose(): void | Promise<void>;
 }
 
 export interface FabricProvider {
@@ -156,7 +231,13 @@ export interface FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<unknown>;
+  acquire?(
+    actionName: string,
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+  ): Promise<FabricScopedProviderResult>;
   invocationEnded?(parentToolCallId: string): Promise<void>;
+  subscribeCatalog?(listener: () => void): () => void;
   close?(): Promise<void>;
 }
 
@@ -170,3 +251,27 @@ export interface FabricProviderDiscovery {
   version: 1;
   register(provider: FabricProvider, options?: { overwrite?: boolean }): void;
 }
+
+export type {
+  FabricCapabilityRequirement,
+  FabricComponentChildOptions,
+  FabricComponentContext,
+  FabricComponentDefinition,
+  FabricComponentDiscovery,
+  FabricComponentDisposer,
+  FabricComponentEffect,
+  FabricComponentEffectConflict,
+  FabricComponentEffectInfo,
+  FabricComponentEffectOptions,
+  FabricComponentEffectRegistration,
+  FabricComponentEntry,
+  FabricComponentGraph,
+  FabricComponentGuarantee,
+  FabricComponentHandle,
+  FabricComponentInfo,
+  FabricComponentProviderLease,
+  FabricComponentProvision,
+  FabricComponentRegistration,
+  FabricComponentState,
+  FabricComponentStopOptions,
+} from "./components/types.js";

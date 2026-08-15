@@ -9,6 +9,7 @@ import {
   type FabricExecutionTraceV1,
 } from "./audit/trace.js";
 import { FabricActivityStore } from "./activity/store.js";
+import type { CapturedToolCatalog } from "./capture/catalog.js";
 import type {
   FabricActivityEventInput,
   FabricActivityItemInput,
@@ -35,6 +36,8 @@ import {
   codeUsesOrchestration,
   isBlockingOrchestrationRef,
 } from "./runtime/orchestration.js";
+import type { FabricCommittedCapabilityView } from "./protocol.js";
+import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
 import type {
   QuickJsRuntime,
   FabricSandboxResult,
@@ -49,6 +52,8 @@ let runtimeDependencies:
       NodeProcessRuntime: typeof import("./runtime/node-process-runtime.js").NodeProcessRuntime;
       typeCheckFabricCode: typeof import("./runtime/type-checker.js").typeCheckFabricCode;
       guestTypeDeclarations: typeof import("./runtime/guest-types.js").guestTypeDeclarations;
+      buildDynamicGuestDeclarations: typeof import("./runtime/dynamic-guest-types.js").buildDynamicGuestDeclarations;
+      buildCoreOverrideGuestDeclarations: typeof import("./runtime/core-override-guest-types.js").buildCoreOverrideGuestDeclarations;
     }>
   | undefined;
 
@@ -58,11 +63,15 @@ const loadRuntimeDependencies = () =>
     import("./runtime/node-process-runtime.js"),
     import("./runtime/type-checker.js"),
     import("./runtime/guest-types.js"),
-  ]).then(([quickjs, nodeProcess, checker, guest]) => ({
+    import("./runtime/dynamic-guest-types.js"),
+    import("./runtime/core-override-guest-types.js"),
+  ]).then(([quickjs, nodeProcess, checker, guest, dynamicGuest, coreOverrides]) => ({
     QuickJsRuntime: quickjs.QuickJsRuntime,
     NodeProcessRuntime: nodeProcess.NodeProcessRuntime,
     typeCheckFabricCode: checker.typeCheckFabricCode,
     guestTypeDeclarations: guest.guestTypeDeclarations,
+    buildDynamicGuestDeclarations: dynamicGuest.buildDynamicGuestDeclarations,
+    buildCoreOverrideGuestDeclarations: coreOverrides.buildCoreOverrideGuestDeclarations,
   }));
 
 const executionOutcomeFromTermination = (
@@ -140,6 +149,7 @@ export interface FabricExecutionOptions {
 export class FabricExecutionService {
   #runtime: QuickJsRuntime | NodeProcessRuntime | undefined;
   #runtimeKind: FabricConfig["executor"]["runtime"] | undefined;
+  #capabilityView: FabricCommittedCapabilityView | undefined;
   constructor(
     readonly registry: ActionRegistry,
     readonly config: FabricConfig,
@@ -147,22 +157,56 @@ export class FabricExecutionService {
     readonly authorizer?: FabricExecutionAuthorizer,
     readonly autoApprovalClassifier = new FabricAutoApprovalClassifier(),
     readonly sessionApprovals = new FabricSessionApprovals(),
+    readonly capturedTools?: CapturedToolCatalog,
   ) {}
+
+  setCapabilityView(view: FabricCommittedCapabilityView | undefined): void {
+    this.#capabilityView = view;
+  }
 
   async execute(options: FabricExecutionOptions): Promise<FabricExecutionResult> {
     const startedAt = performance.now();
     const traceRecorder = new FabricExecutionTraceRecorder();
-    this.activity?.start(options.parentToolCallId, options.display);
+    this.activity?.start(
+      options.parentToolCallId,
+      options.display,
+      options.display?.name?.trim() ? undefined : fabricExecTitleHintCached(options.code),
+    );
     const dependencies = await loadRuntimeDependencies();
     const effectiveFullCodeMode =
       this.config.fullCodeMode || this.config.schema.mode === "enforce";
     const unavailable = new Map(
       this.registry.unavailableProviders().map((entry) => [entry.name, entry.reason]),
     );
+    // Snapshot live mcp/extension tool schemas so the type gate below rejects
+    // argument-shape mistakes on those surfaces pre-execution, the way pi.*
+    // calls already fail. Snapshotting is side-effect-free (cache-warm read);
+    // unavailable or cold providers yield empty sources and the loose
+    // declarations stand.
+    const guestTypeSources = await this.registry.guestTypeSources({
+      cwd: options.context.cwd,
+      signal: options.signal,
+      parentToolCallId: options.parentToolCallId,
+      nestedToolCallId: `${options.parentToolCallId}_typedecls`,
+      extensionContext: options.context,
+      update() {},
+      ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
+    });
+    const coreOverrideDeclarations =
+      effectiveFullCodeMode
+        ? dependencies.buildCoreOverrideGuestDeclarations(
+            this.capturedTools?.list().map((entry) => ({
+              name: entry.name,
+              inputSchema: entry.definition.parameters,
+            })) ?? [],
+          )
+        : undefined;
     const checked = dependencies.typeCheckFabricCode(
       options.code,
       dependencies.guestTypeDeclarations(effectiveFullCodeMode, {
         excludeGlobals: [...unavailable.keys()],
+        dynamic: dependencies.buildDynamicGuestDeclarations(guestTypeSources),
+        ...(coreOverrideDeclarations ? { coreOverrides: coreOverrideDeclarations } : {}),
       }),
     );
     if (checked.errors.length > 0) {
@@ -310,6 +354,7 @@ export class FabricExecutionService {
       nestedToolCallId: `${options.parentToolCallId}_metadata`,
       extensionContext: options.context,
       update,
+      ...(this.#capabilityView ? { capabilityView: this.#capabilityView } : {}),
     };
     // Start known orchestration programs with the longer deadline. Calls
     // reached through generic or computed refs are classified again at the
@@ -459,26 +504,14 @@ export class FabricExecutionService {
                 () =>
                   this.registry
                     .providers()
+                    .filter((provider) =>
+                      !callContext.capabilityView ||
+                      Object.values(callContext.capabilityView.bindings)
+                        .some((binding) => binding.provider === provider.name),
+                    )
                     .filter(
                       (provider) => effectiveFullCodeMode || !fullCodeProvider(provider.name),
                     ),
-              );
-            case "fabric.$catalog":
-              return traceAttempt(
-                "fabric.discovery.catalog",
-                args,
-                runtimeSignal,
-                async (setStage) => {
-                  const provider = typeof args.provider === "string" ? args.provider : undefined;
-                  setStage("guard");
-                  if (provider) guardFullCodeRef(`${provider}.*`);
-                  setStage(provider && !this.registry.has(provider) ? "resolve" : "invoke");
-                  return this.registry.catalog(callContext, {
-                    ...(provider ? { provider } : {}),
-                    ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
-                    includeProvider: (name) => effectiveFullCodeMode || !fullCodeProvider(name),
-                  });
-                },
               );
             case "fabric.$catalog":
               return traceAttempt(
@@ -690,6 +723,7 @@ export class FabricExecutionService {
           maxLogChars: this.config.executor.maxOutputChars,
           minimumTimeoutMsForHostCall,
           ...(checked.javascript ? { transpiledCode: checked.javascript } : {}),
+          ...(checked.sourceMap ? { transpiledSourceMap: checked.sourceMap } : {}),
           ...(options.strings ? { strings: options.strings } : {}),
           ...(options.tokenBudget !== undefined ? { tokenBudget: options.tokenBudget } : {}),
           ...(options.signal ? { signal: options.signal } : {}),

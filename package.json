@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.49.5",
+  "version": "0.58.2",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -24,7 +24,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && pnpm run assert:build-artifacts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "certify:context": "pnpm run build && node scripts/certify-context.mjs",
@@ -33,6 +33,7 @@
     "lint:dead": "knip --no-gitignore",
     "check": "pnpm run typecheck && pnpm run build && pnpm run assert:lazy-graph && pnpm run test && pnpm run lint:dead",
     "assert:lazy-graph": "node scripts/assert-lazy-graph-host-free.mjs",
+    "assert:build-artifacts": "node scripts/assert-build-artifacts.mjs",
     "prepack": "pnpm run check"
   },
   "keywords": [
@@ -72,7 +73,7 @@
     "image": "https://raw.githubusercontent.com/monotykamary/pi-fabric/main/media/cover.jpg"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.2",
     "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
     "cross-spawn": "^7.0.6",
     "diff": "^9.0.0",
@@ -88,10 +89,11 @@
     "@earendil-works/pi-tui": ">=0.80.6"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
-    "@earendil-works/pi-tui": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^26.1.2",
+    "esbuild": "^0.25.12",
     "knip": "^6.29.0",
     "vitest": "^4.1.10"
   },
